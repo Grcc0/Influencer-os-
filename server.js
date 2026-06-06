@@ -118,7 +118,7 @@ async function callClaude(prompt, modelAlias) {
   return (d.content || []).map((b) => (b.type === "text" ? b.text : "")).join("").trim();
 }
 
-app.get("/", (_req, res) => res.json({ ok: true, service: "influencer-os-backend", geminiModel: GEMINI_MODEL, dailyUsed: used, dailyCap: DAILY_CAP }));
+app.get("/", (_req, res) => res.json({ ok: true, service: "influencer-os-backend", build: "cors-fix-jun6", geminiModel: GEMINI_MODEL, dailyUsed: used, dailyCap: DAILY_CAP }));
 
 app.post("/api/text", limiter, tokenGuard, dailyGuard, async (req, res) => {
   try {

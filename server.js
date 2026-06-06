@@ -96,13 +96,25 @@ async function callGemini(prompt) {
 async function callClaude(prompt, modelAlias) {
   if (!ANTHROPIC_KEY) throw new Error("ANTHROPIC_API_KEY fehlt");
   const model = CLAUDE_MODELS[modelAlias] || CLAUDE_MODELS.sonnet;
-  const r = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
-    body: JSON.stringify({ model, max_tokens: 1024, messages: [{ role: "user", content: prompt }] }),
-  });
+  console.log("Claude-Aufruf startet, model=" + model);
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), 45000);
+  let r;
+  try {
+    r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model, max_tokens: 8192, messages: [{ role: "user", content: prompt }] }),
+      signal: ctrl.signal,
+    });
+  } catch (e) {
+    throw new Error("Claude-Aufruf fehlgeschlagen (Timeout/Netz): " + String(e.message || e));
+  } finally {
+    clearTimeout(to);
+  }
   if (!r.ok) throw new Error("Claude " + r.status + " " + (await r.text()).slice(0, 300));
   const d = await r.json();
+  console.log("Claude-Antwort erhalten");
   return (d.content || []).map((b) => (b.type === "text" ? b.text : "")).join("").trim();
 }
 

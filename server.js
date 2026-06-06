@@ -18,7 +18,7 @@ app.use((req, res, next) => {
 // Request-Logging — sichtbar in den Render-Logs
 app.use((req, _res, next) => { console.log(new Date().toISOString(), req.method, req.url); next(); });
 
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "10mb" })); // Bilder (Base64) brauchen mehr Platz
 
 const PORT = process.env.PORT || 8787;
 const GEMINI_KEY = process.env.GEMINI_API_KEY || "";
@@ -93,10 +93,18 @@ async function callGemini(prompt) {
   return (d?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
 }
 
-async function callClaude(prompt, modelAlias) {
+async function callClaude(prompt, modelAlias, images) {
   if (!ANTHROPIC_KEY) throw new Error("ANTHROPIC_API_KEY fehlt");
   const model = CLAUDE_MODELS[modelAlias] || CLAUDE_MODELS.sonnet;
-  console.log("Claude-Aufruf startet, model=" + model);
+  // Bilder (optional) als Content-Bloecke VOR dem Text — empfohlen fuer beste Ergebnisse
+  const blocks = [];
+  for (const img of Array.isArray(images) ? images.slice(0, 4) : []) {
+    if (!img || typeof img.data !== "string" || !img.data) continue;
+    if (img.data.length > 6_500_000) throw new Error("Bild zu gross (max ~5MB)");
+    blocks.push({ type: "image", source: { type: "base64", media_type: img.media_type || "image/jpeg", data: img.data } });
+  }
+  blocks.push({ type: "text", text: prompt });
+  console.log("Claude-Aufruf startet, model=" + model + (blocks.length > 1 ? ", bilder=" + (blocks.length - 1) : ""));
   const ctrl = new AbortController();
   const to = setTimeout(() => ctrl.abort(), 45000);
   let r;
@@ -104,7 +112,7 @@ async function callClaude(prompt, modelAlias) {
     r = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({ model, max_tokens: 8192, messages: [{ role: "user", content: prompt }] }),
+      body: JSON.stringify({ model, max_tokens: 8192, messages: [{ role: "user", content: blocks }] }),
       signal: ctrl.signal,
     });
   } catch (e) {
@@ -118,15 +126,17 @@ async function callClaude(prompt, modelAlias) {
   return (d.content || []).map((b) => (b.type === "text" ? b.text : "")).join("").trim();
 }
 
-app.get("/", (_req, res) => res.json({ ok: true, service: "influencer-os-backend", build: "cors-fix-jun6", geminiModel: GEMINI_MODEL, dailyUsed: used, dailyCap: DAILY_CAP }));
+app.get("/", (_req, res) => res.json({ ok: true, service: "influencer-os-backend", build: "i2i-jun6", geminiModel: GEMINI_MODEL, dailyUsed: used, dailyCap: DAILY_CAP }));
 
 app.post("/api/text", limiter, tokenGuard, dailyGuard, async (req, res) => {
   try {
-    const { prompt, provider, model } = req.body || {};
+    const { prompt, provider, model, images } = req.body || {};
     if (!prompt || typeof prompt !== "string") return res.status(400).json({ error: "prompt fehlt" });
     if (prompt.length > 12000) return res.status(413).json({ error: "prompt zu lang" });
-    const result = provider === "claude" ? await callClaude(prompt, model) : await callGemini(prompt);
-    res.json({ provider: provider === "claude" ? "claude" : "gemini", result });
+    const hasImages = Array.isArray(images) && images.length > 0;
+    // Bild-Analyse laeuft immer ueber Claude (Vision)
+    const result = (provider === "claude" || hasImages) ? await callClaude(prompt, model, images) : await callGemini(prompt);
+    res.json({ provider: (provider === "claude" || hasImages) ? "claude" : "gemini", result });
   } catch (e) {
     console.error("api/text Fehler:", e);
     res.status(500).json({ error: String(e.message || e) });

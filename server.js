@@ -1,6 +1,4 @@
 import express from "express";
-import cors from "cors";
-import rateLimit from "express-rate-limit";
 
 const app = express();
 app.set("trust proxy", 1); // korrekte Client-IP hinter Hosting-Proxy (Render/Railway)
@@ -35,11 +33,21 @@ const APP_TOKEN = process.env.APP_TOKEN || "";                  // optional: nur
 
 // (CORS wird oben durch die explizite Middleware gesetzt)
 
-// 1) Rate-Limit je IP — bremst Spam, egal ob Browser oder Skript
-const limiter = rateLimit({
-  windowMs: 60 * 1000, max: PER_MIN, standardHeaders: true, legacyHeaders: false,
-  message: { error: "Zu viele Anfragen — bitte kurz warten." },
-});
+// 1) Rate-Limit je IP — bremst Spam, mit Bordmitteln (kein Zusatzpaket nötig)
+const hits = new Map(); // ip -> { count, resetAt }
+function limiter(req, res, next) {
+  const ip = req.ip || "unknown";
+  const now = Date.now();
+  const rec = hits.get(ip);
+  if (!rec || now > rec.resetAt) {
+    hits.set(ip, { count: 1, resetAt: now + 60 * 1000 });
+  } else {
+    rec.count++;
+    if (rec.count > PER_MIN) return res.status(429).json({ error: "Zu viele Anfragen — bitte kurz warten." });
+  }
+  if (hits.size > 5000) { for (const [k, v] of hits) if (now > v.resetAt) hits.delete(k); }
+  next();
+}
 
 // 2) Hartes Tageslimit — begrenzt den maximalen Schaden bei Missbrauch
 let day = new Date().toISOString().slice(0, 10), used = 0;

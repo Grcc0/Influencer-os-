@@ -95,12 +95,13 @@ async function callGemini(prompt) {
   return (d?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
 }
 
-// Bild-Generierung via Gemini (Nano Banana). Optionales Anchor-Bild fuer Charakter-Konsistenz.
-async function callGeminiImage(prompt, anchor, opts = {}) {
+// Bild-Generierung via Gemini (Nano Banana). Optionale Anchor-Bilder fuer Charakter-Konsistenz (mehrere moeglich).
+async function callGeminiImage(prompt, anchors, opts = {}) {
   if (!GEMINI_KEY) throw new Error("GEMINI_API_KEY fehlt");
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_IMAGE_MODEL}:generateContent`;
   const parts = [{ text: prompt }];
-  if (anchor && anchor.data) parts.push({ inline_data: { mime_type: anchor.media_type || "image/jpeg", data: anchor.data } });
+  const list = Array.isArray(anchors) ? anchors : (anchors ? [anchors] : []);
+  for (const an of list) { if (an && an.data) parts.push({ inline_data: { mime_type: an.media_type || "image/jpeg", data: an.data } }); }
   const body = {
     contents: [{ parts }],
     generationConfig: {
@@ -173,7 +174,7 @@ async function callClaude(prompt, modelAlias, images) {
   return (d.content || []).map((b) => (b.type === "text" ? b.text : "")).join("").trim();
 }
 
-app.get("/", (_req, res) => res.json({ ok: true, service: "influencer-os-backend", build: "img-jun7", geminiModel: GEMINI_MODEL, imageModel: GEMINI_IMAGE_MODEL, dailyUsed: used, dailyCap: DAILY_CAP, imageUsed: imgUsed, imageCap: IMAGE_DAILY_CAP }));
+app.get("/", (_req, res) => res.json({ ok: true, service: "influencer-os-backend", build: "multi-img-jun7", geminiModel: GEMINI_MODEL, imageModel: GEMINI_IMAGE_MODEL, dailyUsed: used, dailyCap: DAILY_CAP, imageUsed: imgUsed, imageCap: IMAGE_DAILY_CAP }));
 
 // Hartes Bild-Tageslimit (separat vom Text-Limit) als Kostenschutz
 let imgDay = new Date().toISOString().slice(0, 10), imgUsed = 0;
@@ -186,15 +187,19 @@ function imageDailyGuard(_req, res, next) {
 
 app.post("/api/image", limiter, tokenGuard, imageDailyGuard, async (req, res) => {
   try {
-    const { prompt, image, aspectRatio, size } = req.body || {};
+    const { prompt, image, images, aspectRatio, size } = req.body || {};
     if (!prompt || typeof prompt !== "string") return res.status(400).json({ error: "prompt fehlt" });
     if (prompt.length > 8000) return res.status(413).json({ error: "prompt zu lang" });
-    let anchor = null;
-    if (image && typeof image.data === "string" && image.data) {
-      if (image.data.length > 8_000_000) return res.status(413).json({ error: "Anchor-Bild zu gross" });
-      anchor = { data: image.data, media_type: image.media_type || "image/jpeg" };
+    const raw = Array.isArray(images) ? images : (image ? [image] : []);
+    const anchors = [];
+    for (const im of raw) {
+      if (im && typeof im.data === "string" && im.data) {
+        if (im.data.length > 8_000_000) return res.status(413).json({ error: "Anchor-Bild zu gross" });
+        anchors.push({ data: im.data, media_type: im.media_type || "image/jpeg" });
+      }
+      if (anchors.length >= 4) break; // Kosten/Tempo
     }
-    const out = await callGeminiImage(prompt, anchor, { aspectRatio, size });
+    const out = await callGeminiImage(prompt, anchors, { aspectRatio, size });
     res.json(out);
   } catch (e) {
     console.error("api/image Fehler:", e);

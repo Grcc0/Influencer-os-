@@ -23,6 +23,8 @@ app.use(express.json({ limit: "10mb" })); // Bilder (Base64) brauchen mehr Platz
 const PORT = process.env.PORT || 8787;
 const GEMINI_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const GEMINI_IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL || "gemini-3.1-flash-image-preview";
+const IMAGE_DAILY_CAP = Number(process.env.IMAGE_DAILY_CAP || 60); // Kostenbremse: max. erzeugte Bilder/Tag
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || "";
 
 // --- Sicherheit ohne Login ---
@@ -93,6 +95,51 @@ async function callGemini(prompt) {
   return (d?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
 }
 
+// Bild-Generierung via Gemini (Nano Banana). Optionales Anchor-Bild fuer Charakter-Konsistenz.
+async function callGeminiImage(prompt, anchor, opts = {}) {
+  if (!GEMINI_KEY) throw new Error("GEMINI_API_KEY fehlt");
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_IMAGE_MODEL}:generateContent`;
+  const parts = [{ text: prompt }];
+  if (anchor && anchor.data) parts.push({ inline_data: { mime_type: anchor.media_type || "image/jpeg", data: anchor.data } });
+  const body = {
+    contents: [{ parts }],
+    generationConfig: {
+      responseModalities: ["TEXT", "IMAGE"],
+      imageConfig: { imageSize: opts.size || "1K", aspectRatio: opts.aspectRatio || "1:1" },
+    },
+  };
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), 90000); // Bilder dauern laenger
+  let r;
+  try {
+    r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_KEY },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+  } catch (e) {
+    throw new Error("Gemini-Bild fehlgeschlagen (Timeout/Netz): " + String(e.message || e));
+  } finally {
+    clearTimeout(to);
+  }
+  if (!r.ok) {
+    const t = (await r.text()).slice(0, 400);
+    if (r.status === 403 || /billing|quota|permission/i.test(t)) {
+      throw new Error("Gemini 403 — vermutlich ist fuer den API-Key noch kein Billing aktiviert (Bild-Generierung hat kein Gratis-Kontingent). " + t);
+    }
+    throw new Error("Gemini-Bild " + r.status + " " + t);
+  }
+  const d = await r.json();
+  const ps = d?.candidates?.[0]?.content?.parts || [];
+  for (const p of ps) {
+    const inl = p.inlineData || p.inline_data;
+    if (inl && inl.data) return { data: inl.data, mime: inl.mimeType || inl.mime_type || "image/png" };
+  }
+  const txt = ps.map((p) => p.text || "").join(" ").trim();
+  throw new Error("Kein Bild erhalten" + (txt ? (": " + txt.slice(0, 200)) : " (evtl. durch Sicherheitsfilter blockiert)."));
+}
+
 async function callClaude(prompt, modelAlias, images) {
   if (!ANTHROPIC_KEY) throw new Error("ANTHROPIC_API_KEY fehlt");
   const model = CLAUDE_MODELS[modelAlias] || CLAUDE_MODELS.sonnet;
@@ -126,7 +173,35 @@ async function callClaude(prompt, modelAlias, images) {
   return (d.content || []).map((b) => (b.type === "text" ? b.text : "")).join("").trim();
 }
 
-app.get("/", (_req, res) => res.json({ ok: true, service: "influencer-os-backend", build: "i2i-jun6", geminiModel: GEMINI_MODEL, dailyUsed: used, dailyCap: DAILY_CAP }));
+app.get("/", (_req, res) => res.json({ ok: true, service: "influencer-os-backend", build: "img-jun7", geminiModel: GEMINI_MODEL, imageModel: GEMINI_IMAGE_MODEL, dailyUsed: used, dailyCap: DAILY_CAP, imageUsed: imgUsed, imageCap: IMAGE_DAILY_CAP }));
+
+// Hartes Bild-Tageslimit (separat vom Text-Limit) als Kostenschutz
+let imgDay = new Date().toISOString().slice(0, 10), imgUsed = 0;
+function imageDailyGuard(_req, res, next) {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== imgDay) { imgDay = today; imgUsed = 0; }
+  if (imgUsed >= IMAGE_DAILY_CAP) return res.status(429).json({ error: "Bild-Tageslimit erreicht (Kostenschutz). Morgen wieder oder Limit in den Render-Variablen erhoehen." });
+  imgUsed++; next();
+}
+
+app.post("/api/image", limiter, tokenGuard, imageDailyGuard, async (req, res) => {
+  try {
+    const { prompt, image, aspectRatio, size } = req.body || {};
+    if (!prompt || typeof prompt !== "string") return res.status(400).json({ error: "prompt fehlt" });
+    if (prompt.length > 8000) return res.status(413).json({ error: "prompt zu lang" });
+    let anchor = null;
+    if (image && typeof image.data === "string" && image.data) {
+      if (image.data.length > 8_000_000) return res.status(413).json({ error: "Anchor-Bild zu gross" });
+      anchor = { data: image.data, media_type: image.media_type || "image/jpeg" };
+    }
+    const out = await callGeminiImage(prompt, anchor, { aspectRatio, size });
+    res.json(out);
+  } catch (e) {
+    console.error("api/image Fehler:", e);
+    imgUsed = Math.max(0, imgUsed - 1); // fehlgeschlagene Generierung nicht aufs Limit anrechnen
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
 
 app.post("/api/text", limiter, tokenGuard, dailyGuard, async (req, res) => {
   try {
